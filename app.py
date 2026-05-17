@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import urllib.request
 from pathlib import Path
 
 import pandas as pd
@@ -14,6 +17,7 @@ from src.model_registry import CLASS_NAMES, load_checkpoint_model
 
 ROOT = Path(__file__).resolve().parent
 RESULTS_PATH = ROOT / "reports" / "model_results.json"
+MODEL_CACHE_DIR = Path(tempfile.gettempdir()) / "intel_image_classification_models"
 
 
 st.set_page_config(
@@ -113,6 +117,92 @@ def load_models(model_rows: tuple[tuple[str, str, str], ...], device_name: str):
             "model": load_checkpoint_model(model_name, checkpoint_path, device),
         }
     return models
+
+
+def get_config_value(key: str) -> str | None:
+    env_value = os.getenv(key)
+    if env_value:
+        return env_value
+    try:
+        secret_value = st.secrets.get(key)
+    except Exception:
+        secret_value = None
+    return str(secret_value) if secret_value else None
+
+
+def get_checkpoint_url(row: pd.Series) -> str | None:
+    model_key = f"{str(row['model_name']).upper()}_CHECKPOINT_URL"
+    model_url = get_config_value(model_key)
+    if model_url:
+        return model_url
+
+    base_url = get_config_value("MODEL_BASE_URL")
+    if base_url:
+        filename = Path(str(row["checkpoint"])).name
+        return f"{base_url.rstrip('/')}/{filename}"
+
+    return None
+
+
+def download_checkpoint(url: str, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_suffix(destination.suffix + ".tmp")
+    request = urllib.request.Request(url, headers={"User-Agent": "streamlit"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        with temp_path.open("wb") as f:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    temp_path.replace(destination)
+
+
+def resolve_checkpoint_path(row: pd.Series) -> Path | None:
+    local_path = Path(str(row["checkpoint_path"]))
+    if local_path.exists():
+        return local_path
+
+    cache_path = MODEL_CACHE_DIR / Path(str(row["checkpoint"])).name
+    if cache_path.exists():
+        return cache_path
+
+    checkpoint_url = get_checkpoint_url(row)
+    if not checkpoint_url:
+        return None
+
+    download_checkpoint(checkpoint_url, cache_path)
+    return cache_path
+
+
+def render_missing_checkpoint_help(missing_models: list[dict[str, str]]) -> None:
+    st.error("Some checkpoint files are missing and no download URL is configured.")
+    help_rows = [
+        {
+            "Model": item["display_name"],
+            "Expected local file": item["checkpoint"],
+            "Secret or env key": item["url_key"],
+        }
+        for item in missing_models
+    ]
+    st.dataframe(pd.DataFrame(help_rows), use_container_width=True, hide_index=True)
+    st.info(
+        "On Streamlit Cloud, upload the .pth files to a direct-download host, then add either "
+        "MODEL_BASE_URL or the per-model URL keys in App settings > Secrets."
+    )
+    st.code(
+        "\n".join(
+            [
+                'MODEL_BASE_URL = "https://your-host/path"',
+                'SIMPLE_CNN_CHECKPOINT_URL = "https://your-host/simple_cnn_best.pth"',
+                'MOBILENET_V2_CHECKPOINT_URL = "https://your-host/mobilenet_v2_best.pth"',
+                'RESNET50_CHECKPOINT_URL = "https://your-host/resnet50_best.pth"',
+                'SWIN_T_CHECKPOINT_URL = "https://your-host/swin_t_best.pth"',
+                'VIT_B_16_CHECKPOINT_URL = "https://your-host/vit_b_16_best.pth"',
+            ]
+        ),
+        language="toml",
+    )
 
 
 def get_device() -> torch.device:
@@ -245,19 +335,32 @@ def render_prediction(results_df: pd.DataFrame) -> None:
     with image_col:
         st.image(image, caption="Uploaded image", use_container_width=True)
 
-    missing = [
-        row["checkpoint"]
-        for _, row in results_df.iterrows()
-        if not Path(row["checkpoint_path"]).exists()
-    ]
+    resolved_rows = []
+    missing = []
+    with st.spinner("Checking checkpoint files..."):
+        for _, row in results_df.iterrows():
+            try:
+                checkpoint_path = resolve_checkpoint_path(row)
+            except Exception as exc:
+                st.error(f"Failed to download {row['display_name']}: {exc}")
+                return
+
+            if checkpoint_path is None:
+                missing.append(
+                    {
+                        "display_name": str(row["display_name"]),
+                        "checkpoint": str(row["checkpoint"]),
+                        "url_key": f"{str(row['model_name']).upper()}_CHECKPOINT_URL",
+                    }
+                )
+            else:
+                resolved_rows.append((row["model_name"], row["display_name"], str(checkpoint_path)))
+
     if missing:
-        st.error("Missing checkpoint files: " + ", ".join(missing))
+        render_missing_checkpoint_help(missing)
         return
 
-    model_rows = tuple(
-        (row["model_name"], row["display_name"], row["checkpoint_path"])
-        for _, row in results_df.iterrows()
-    )
+    model_rows = tuple(resolved_rows)
 
     with st.spinner("Running predictions with all models..."):
         models = load_models(model_rows, str(device))

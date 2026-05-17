@@ -225,5 +225,7 @@ __pycache__/
 *.pyd
 
 data/
-models/
+models/*
+!models/.gitkeep
+!models/*.pth
 .DS_Store
